@@ -185,6 +185,10 @@ export interface DefectScanMeta {
 
 export interface LiveFrameResult extends DefectScanMeta {
   detections: DefectDetection[];
+  quality_gate?: QualityGateResult;
+  decision?: string;
+  decision_code?: string;
+  decision_reasons?: string[];
 }
 
 export interface DefectAnalyzeResult {
@@ -238,8 +242,118 @@ export interface DefectInspection {
   reviewer_actions?: ReviewAction[];
   audit_events?: AuditEvent[];
   root_causes?: RootCauseHint[];
+  decision_analysis?: DecisionAnalysis;
+  quality_gate?: QualityGateResult;
+  reference_analysis?: ReferenceComparisonResult;
   created_at: string;
   updated_at?: string;
+}
+
+export interface QualityGateResult {
+  status: 'SUITABLE' | 'SUITABLE_WITH_WARNINGS' | 'UNSUITABLE' | string;
+  quality_status?: string;
+  quality_score: number;
+  recapture_recommended: boolean;
+  measurements: {
+    sharpness?: number;
+    sharpness_index?: number;
+    sharpness_threshold?: number;
+    exposure?: number;
+    mean_luminance?: number;
+    contrast_std?: number;
+    glare_ratio?: number;
+    glare_ratio_max?: number;
+    dimensions?: [number, number];
+    product_coverage_ratio?: number;
+  };
+  issues: string[];
+  warnings: string[];
+  recommended_actions: string[];
+  recommendations?: string[];
+}
+
+export interface DecisionAnalysis {
+  outcome: 'PASS' | 'DEFECTIVE' | 'REVIEW' | string;
+  decision_code: string;
+  policy_version: string;
+  primary_reason: string;
+  reasons: string[];
+  rule_violations: string[];
+  confidence_band: string;
+  human_review_required: boolean;
+}
+
+export interface ReferenceComparisonResult {
+  reference_version: string;
+  profile_category: string;
+  alignment: {
+    method: string;
+    inlier_count: number;
+    total_matches: number;
+    alignment_confidence: number;
+    status: string;
+  };
+  within_tolerance: boolean;
+  mean_delta_e: number;
+  max_color_delta_e_tolerance: number;
+  anomaly_area_ratio: number;
+  anomaly_area_tolerance: number;
+  anomaly_regions_count: number;
+  difference_heatmap_base64: string;
+  aligned_inspected_base64: string;
+  similarity_score?: number;
+  aligned?: boolean;
+}
+
+export interface EdgeBenchmarkReport {
+  test_configuration: {
+    timestamp: string;
+    hardware: string;
+    model: string;
+    model_size_mb: number;
+    parameters_total: number;
+    input_resolution: number[];
+    warmup_runs: number;
+    benchmark_runs: number;
+  };
+  pipeline_latency_ms: {
+    image_acquisition_or_synthetic_load: { mean: number; p50: number; p95: number };
+    image_quality_gate: { mean: number; p50: number; p95: number };
+    neural_input_preprocessing: { mean: number; p50: number; p95: number };
+    onnx_neural_inference_defectnet: { mean: number; p50: number; p95: number };
+    opencv_morphological_linear_shading: { mean: number; p50: number; p95: number };
+    nms_and_fusion_postprocessing: { mean: number; p50: number; p95: number };
+    end_to_end_full_pipeline: { mean: number; p50: number; p95: number };
+  };
+  system_resources: {
+    cpu_usage_pct: number;
+    memory_process_rss_mb: number;
+    system_memory_used_pct: number;
+  };
+  throughput_fps: {
+    neural_only_fps: number;
+    end_to_end_fps: number;
+  };
+  deployment_readiness: {
+    edge_device_profile: string;
+    neural_latency_acceptable_for_30fps: boolean;
+    pipeline_status: string;
+    recommendation: string;
+  };
+}
+
+export interface ParetoAnalysis {
+  total_detections: number;
+  total_confirmed: number;
+  vital_few: string[];
+  pareto_distribution: Array<{
+    category: string;
+    count: number;
+    confirmed_count: number;
+    percentage: number;
+    cumulative_percentage: number;
+    in_vital_few: boolean;
+  }>;
 }
 
 export interface DefectAnalytics {
@@ -296,10 +410,75 @@ export interface DefectLogItem extends DefectDetection {
 
 export interface DefectDetectorStatus {
   backend: string;
+  precision?: string;
   opencv_version: string;
   model_loaded: boolean;
   model_path: string | null;
+  int8_available?: boolean;
+  jetson_profile_available?: boolean;
   model_classes: string[];
   model_error: string | null;
   defect_types: string[];
+}
+
+export interface JetsonProfile {
+  model_name: string;
+  fp32_size_kb: number;
+  int8_size_kb: number;
+  compression_ratio: number;
+  size_reduction_pct: number;
+  quantization_type: string;
+  cpu_benchmarks: {
+    fp32_mean_latency_ms: number;
+    fp32_throughput_fps: number;
+    int8_mean_latency_ms: number;
+    int8_throughput_fps: number;
+  };
+  jetson_orin_nano_specifications: {
+    target_device: string;
+    gpu_architecture: string;
+    ai_performance_tops: number;
+    tensorrt_precision: string;
+    estimated_jetson_tensorrt_latency_ms: number;
+    estimated_jetson_throughput_fps: number;
+    power_profiles: string[];
+  };
+}
+
+export interface AnomalyPrediction {
+  anomaly_score: number;
+  raw_anomaly_distance: number;
+  is_anomaly: boolean;
+  threshold: number;
+  anomaly_regions: Array<{
+    box: [number, number, number, number];
+    class: string;
+    confidence: number;
+    area_px: number;
+    anomaly_distance: number;
+    severity: string;
+  }>;
+  heatmap_base64: string;
+  patches_analyzed: number;
+  latency_ms: number;
+  memory_bank_size: number;
+}
+
+export interface PLCStatus {
+  online: boolean;
+  protocol: string;
+  host: string;
+  port: number;
+  simulation_mode: boolean;
+  coils: Record<string, boolean>;
+  holding_registers: Record<string, number>;
+  opc_ua_nodes: Record<string, any>;
+  last_actuation?: {
+    timestamp: string;
+    event_type: string;
+    actuator: string;
+    duration_ms: number;
+    defect_class: string;
+  };
+  rejection_rate_pct: number;
 }

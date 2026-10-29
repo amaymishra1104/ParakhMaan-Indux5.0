@@ -1,0 +1,38 @@
+{
+  "model_name": "ParakhMaanDefectNet v1.0 (INT8 Quantized)",
+  "fp32_model_path": "C:\\Users\\Amay\\ParakhMaan-Indux5.0\\backend\\app\\models_cv\\parakhmaan_defect_v1.onnx",
+  "int8_model_path": "C:\\Users\\Amay\\ParakhMaan-Indux5.0\\backend\\app\\models_cv\\parakhmaan_defect_v1_int8.onnx",
+  "fp32_size_kb": 1555.7,
+  "int8_size_kb": 406.38,
+  "compression_ratio": 3.83,
+  "size_reduction_pct": 73.9,
+  "quantization_type": "dynamic_int8",
+  "weight_type": "qint8",
+  "input_resolution": "640x640",
+  "cpu_benchmarks": {
+    "fp32_mean_latency_ms": 24.89,
+    "fp32_throughput_fps": 40.2,
+    "int8_mean_latency_ms": 151.21,
+    "int8_throughput_fps": 6.6
+  },
+  "jetson_orin_nano_specifications": {
+    "target_device": "NVIDIA Jetson Orin Nano (8GB / 4GB)",
+    "gpu_architecture": "NVIDIA Ampere (1024 CUDA Cores, 32 Tensor Cores)",
+    "ai_performance_tops": 40.0,
+    "recommended_execution_providers": [
+      "TensorrtExecutionProvider",
+      "CUDAExecutionProvider",
+      "CPUExecutionProvider"
+    ],
+    "tensorrt_precision": "INT8 / FP16 hybrid",
+    "dp4a_support": true,
+    "estimated_jetson_tensorrt_latency_ms": 4.48,
+    "estimated_jetson_throughput_fps": 223.2,
+    "power_profiles": [
+      "7W (Low Power)",
+      "15W (Standard)",
+      "20W (High Performance)"
+    ]
+  },
+  "generated_at": "2026-10-28T19:41:38Z"
+}

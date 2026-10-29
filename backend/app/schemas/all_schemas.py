@@ -279,6 +279,9 @@ class DefectInspectionDetailResponse(BaseModel):
     reviewer_actions: List[ReviewActionResponse] = []
     audit_events: List[AuditEventResponse] = []
     root_causes: List[Dict[str, Any]] = []
+    decision_analysis: Optional[Dict[str, Any]] = None
+    quality_gate: Optional[Dict[str, Any]] = None
+    reference_analysis: Optional[Dict[str, Any]] = None
     created_at: datetime
     updated_at: datetime
 
@@ -298,6 +301,13 @@ class DefectFrameRequest(BaseModel):
     image_base64: str
     max_side: int = Field(640, ge=160, le=1920)
     inspection_id: Optional[str] = None  # uses that inspection's golden reference, if any
+    product_profile: Optional[str] = "METAL_SHEET"
+
+class GoldenReferenceCompareRequest(BaseModel):
+    inspected_image_base64: str
+    reference_image_base64: Optional[str] = None
+    inspection_id: Optional[str] = None
+    profile_name: Optional[str] = "METAL_SHEET"
 
 class DefectFinalizeRequest(BaseModel):
     final_remarks: Optional[str] = None

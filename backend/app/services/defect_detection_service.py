@@ -121,43 +121,88 @@ class DefectDetector:
 
     def __init__(self):
         self.backend = (settings.DEFECT_DETECTOR_BACKEND or "hybrid").lower()
+        self.precision = "FP32"
         self._net = None
+        self._session = None
+        self._input_name = None
         self._classes: List[str] = []
         self._model_error: Optional[str] = None
+        self._active_model_path = settings.DEFECT_MODEL_PATH
         self._load_model()
 
     # ------------------------------------------------------------------ model plug-in
-    def _load_model(self) -> None:
-        path = settings.DEFECT_MODEL_PATH
+    def _load_model(self, model_path: Optional[str] = None) -> None:
+        path = model_path or self._active_model_path or settings.DEFECT_MODEL_PATH
         if not path:
             return
         if not os.path.exists(path):
             self._model_error = f"Model file not found: {path}"
             return
+
+        self._active_model_path = path
+        # Attempt 1: onnxruntime session (optimal performance, broad operator support)
         try:
-            self._net = cv2.dnn.readNetFromONNX(path)
-        except Exception as e:
-            self._net = None
-            self._model_error = f"Failed to load ONNX model: {e}"
-            return
+            import onnxruntime as ort
+            sess_opts = ort.SessionOptions()
+            sess_opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            sess_opts.intra_op_num_threads = min(4, os.cpu_count() or 2)
+            self._session = ort.InferenceSession(path, sess_opts, providers=["CPUExecutionProvider"])
+            self._input_name = self._session.get_inputs()[0].name
+            self._model_error = None
+        except Exception as e_ort:
+            self._session = None
+            # Attempt 2: fallback to OpenCV DNN
+            try:
+                self._net = cv2.dnn.readNetFromONNX(path)
+                self._model_error = None
+            except Exception as e_cv:
+                self._net = None
+                self._model_error = f"Failed to load ONNX model via onnxruntime ({e_ort}) and OpenCV ({e_cv})"
+                return
 
         if settings.DEFECT_MODEL_CLASSES:
             self._classes = [c.strip() for c in settings.DEFECT_MODEL_CLASSES.split(",") if c.strip()]
         else:
             names_path = os.path.splitext(path)[0] + ".names"
+            if not os.path.exists(names_path):
+                # Fallback to base model names file if running INT8
+                names_path = os.path.join(os.path.dirname(path), "parakhmaan_defect_v1.names")
             if os.path.exists(names_path):
                 with open(names_path, "r", encoding="utf-8") as f:
                     self._classes = [line.strip() for line in f if line.strip()]
 
+    def switch_precision(self, precision: str) -> Dict[str, Any]:
+        """Dynamically switches detector between FP32 and INT8 quantization modes."""
+        prec = precision.upper()
+        base_dir = os.path.dirname(settings.DEFECT_MODEL_PATH)
+        if prec == "INT8":
+            int8_path = os.path.join(base_dir, "parakhmaan_defect_v1_int8.onnx")
+            if not os.path.exists(int8_path):
+                from scripts.quantize_model_int8 import quantize_fp32_to_int8
+                quantize_fp32_to_int8(settings.DEFECT_MODEL_PATH, int8_path)
+            self._load_model(int8_path)
+            self.precision = "INT8"
+        else:
+            self._load_model(settings.DEFECT_MODEL_PATH)
+            self.precision = "FP32"
+        return self.status()
+
     def status(self) -> Dict[str, Any]:
+        base_dir = os.path.dirname(settings.DEFECT_MODEL_PATH) if settings.DEFECT_MODEL_PATH else ""
+        int8_file = os.path.join(base_dir, "parakhmaan_defect_v1_int8.onnx") if base_dir else ""
+        jetson_profile = os.path.join(base_dir, "jetson_orin_nano_profile.json") if base_dir else ""
         return {
             "backend": self.backend,
+            "precision": self.precision,
             "opencv_version": cv2.__version__,
-            "model_loaded": self._net is not None,
-            "model_path": settings.DEFECT_MODEL_PATH or None,
+            "model_loaded": (self._session is not None) or (self._net is not None),
+            "inference_engine": "ONNXRuntime" if self._session is not None else ("OpenCV_DNN" if self._net is not None else "None"),
+            "model_path": self._active_model_path,
+            "int8_available": os.path.exists(int8_file),
+            "jetson_profile_available": os.path.exists(jetson_profile),
             "model_classes": self._classes,
             "model_error": self._model_error,
-            "defect_types": DEFECT_TYPES,
+            "defect_types": DEFECT_TYPES + ["UNSUPERVISED_ANOMALY"],
         }
 
     @staticmethod
@@ -175,7 +220,13 @@ class DefectDetector:
         ref = cv2.imread(reference_path) if reference_path and os.path.exists(reference_path) else None
         return self.detect(img, ref, max_side=max_side)
 
-    def detect(self, image: np.ndarray, reference: Optional[np.ndarray] = None, max_side: Optional[int] = None) -> Dict[str, Any]:
+    def detect(
+        self,
+        image: np.ndarray,
+        reference: Optional[np.ndarray] = None,
+        max_side: Optional[int] = None,
+        use_unsupervised_anomaly: bool = False,
+    ) -> Dict[str, Any]:
         t0 = time.perf_counter()
         h0, w0 = image.shape[:2]
         limit = max_side or self.WORK_MAX_SIDE
@@ -188,7 +239,7 @@ class DefectDetector:
         detections: List[Dict[str, Any]] = []
         backends: List[str] = []
 
-        use_model = self._net is not None and self.backend in ("onnx", "hybrid")
+        use_model = (self._session is not None or self._net is not None) and self.backend in ("onnx", "hybrid")
         if use_model:
             detections.extend(self._detect_onnx(image))
             backends.append("ONNX")
@@ -202,6 +253,64 @@ class DefectDetector:
             detections.extend(d for d in cv_dets if all(_iou(d["bbox"], b) < 0.3 for b in model_boxes))
             backends.append("OPENCV")
 
+        # For neural model detections, filter those lying outside the product mask or identical in golden reference
+        if product_mask_used:
+            mask, _, _ = self._segment_product(work)
+            mh, mw = mask.shape[:2]
+            inside_dets = []
+            for d in detections:
+                if d.get("detector") == "ONNX":
+                    cx = int(round((d["bbox"][0] + d["bbox"][2]) * 0.5 * scale))
+                    cy = int(round((d["bbox"][1] + d["bbox"][3]) * 0.5 * scale))
+                    if 0 <= cy < mh and 0 <= cx < mw and mask[cy, cx] == 0:
+                        continue  # Background conveyor false positive
+                inside_dets.append(d)
+            detections = inside_dets
+
+        # If a golden reference is provided, suppress ONNX detections on features present in the golden sample
+        if ref_work is not None:
+            wh, ww = work.shape[:2]
+            ref_suppressed = []
+            for d in detections:
+                if d.get("detector") == "ONNX":
+                    x1 = max(0, int(round(d["bbox"][0] * scale)))
+                    y1 = max(0, int(round(d["bbox"][1] * scale)))
+                    x2 = min(ww, int(round(d["bbox"][2] * scale)))
+                    y2 = min(wh, int(round(d["bbox"][3] * scale)))
+                    if x2 > x1 and y2 > y1:
+                        patch_diff = cv2.absdiff(work[y1:y2, x1:x2], ref_work[y1:y2, x1:x2])
+                        if float(patch_diff.max()) < 15.0:
+                            continue  # Feature identical to golden reference
+                ref_suppressed.append(d)
+            detections = ref_suppressed
+
+        # Unsupervised PatchCore Anomaly Detection
+        if use_unsupervised_anomaly:
+            try:
+                from app.services.patchcore_anomaly_service import patchcore_service
+                ano_res = patchcore_service.predict(image)
+                if ano_res.get("is_anomaly") and ano_res.get("anomaly_regions"):
+                    existing_boxes = [d["bbox"] for d in detections]
+                    for reg in ano_res["anomaly_regions"]:
+                        rx1, ry1, rx2, ry2 = reg["box"]
+                        rbox = [rx1, ry1, rx2, ry2]
+                        if all(_iou(rbox, eb) < 0.3 for eb in existing_boxes):
+                            detections.append({
+                                "type": "UNSUPERVISED_ANOMALY",
+                                "bbox": rbox,
+                                "confidence": reg["confidence"],
+                                "severity": reg["severity"],
+                                "metrics": {
+                                    "anomaly_score": ano_res["anomaly_score"],
+                                    "raw_distance": reg["anomaly_distance"],
+                                    "patch_area": reg["area_px"],
+                                },
+                                "detector": "PATCHCORE_MEMORY_BANK"
+                            })
+                    backends.append("PATCHCORE")
+            except Exception as e_ano:
+                logger.warning(f"PatchCore anomaly integration error: {e_ano}")
+
         detections = [self._finalize(d, w0, h0) for d in detections]
         detections = [d for d in detections if d is not None]
         detections.sort(key=lambda d: (SEVERITY_ORDER.get(d["severity"], 0), d["confidence"]), reverse=True)
@@ -210,9 +319,25 @@ class DefectDetector:
         brightness = float(work.mean())
         exposure_ok = 35.0 <= brightness <= 240.0
         latency_ms = (time.perf_counter() - t0) * 1000.0
+        outcome = compute_outcome(detections, quality_issue=not exposure_ok)
+
+        # Trigger Industrial PLC / Pneumatic Valve Actuation
+        plc_actuation = None
+        try:
+            from app.services.industrial_plc_service import plc_service
+            top_det = detections[0] if detections else None
+            plc_actuation = plc_service.record_inspection_verdict(
+                outcome=outcome,
+                latency_ms=latency_ms,
+                defect_class=top_det.get("type") if top_det else None,
+                confidence=top_det.get("confidence", 0.95) if top_det else 0.98,
+            )
+        except Exception as e_plc:
+            logger.warning(f"PLC communication trigger failed: {e_plc}")
+
         return {
             "detections": detections,
-            "outcome": compute_outcome(detections, quality_issue=not exposure_ok),
+            "outcome": outcome,
             "mean_brightness": round(brightness, 1),
             "exposure_ok": exposure_ok,
             "latency_ms": round(latency_ms, 1),
@@ -221,6 +346,7 @@ class DefectDetector:
             "image_size": [w0, h0],
             "product_mask_used": product_mask_used,
             "reference_used": reference is not None,
+            "plc_actuation": plc_actuation,
         }
 
     # ------------------------------------------------------------------ OpenCV pipeline
@@ -642,20 +768,29 @@ class DefectDetector:
         canvas = np.full((size, size, 3), 114, dtype=np.uint8)
         canvas[: resized.shape[0], : resized.shape[1]] = resized
 
-        blob = cv2.dnn.blobFromImage(canvas, 1 / 255.0, (size, size), swapRB=True, crop=False)
-        self._net.setInput(blob)
-        out = np.squeeze(self._net.forward())
+        if self._session is not None:
+            # ONNXRuntime inference session
+            blob = (canvas.astype(np.float32) / 255.0).transpose(2, 0, 1)[None, ...]
+            outputs = self._session.run(None, {self._input_name: blob})
+            out = np.squeeze(outputs[0])
+        elif self._net is not None:
+            blob = cv2.dnn.blobFromImage(canvas, 1 / 255.0, (size, size), swapRB=True, crop=False)
+            self._net.setInput(blob)
+            out = np.squeeze(self._net.forward())
+        else:
+            return []
+
         if out.ndim != 2:
             return []
         if out.shape[0] < out.shape[1]:
-            out = out.T  # YOLOv8 emits (4 + classes, N)
+            out = out.T  # YOLOv8 layout emits (4 + classes, N)
 
         boxes, scores = out[:, :4], out[:, 4:]
         if self._classes and scores.shape[1] == len(self._classes) + 1:
             scores = scores[:, 1:] * scores[:, :1]  # YOLOv5 layout with objectness
         class_ids = scores.argmax(axis=1)
         confs = scores.max(axis=1)
-        keep = confs >= settings.DEFECT_MODEL_CONF_THRESHOLD
+        keep = confs >= max(0.55, settings.DEFECT_MODEL_CONF_THRESHOLD)
         boxes, class_ids, confs = boxes[keep], class_ids[keep], confs[keep]
         if len(confs) == 0:
             return []

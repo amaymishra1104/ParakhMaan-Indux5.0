@@ -10,7 +10,13 @@ import {
   DefectAnalytics,
   DefectLogItem,
   DefectDetectorStatus,
-  LiveFrameResult
+  LiveFrameResult,
+  EdgeBenchmarkReport,
+  ParetoAnalysis,
+  ReferenceComparisonResult,
+  JetsonProfile,
+  AnomalyPrediction,
+  PLCStatus
 } from './types';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8080/api/v1';
@@ -381,5 +387,99 @@ export const defectApi = {
       if (v !== undefined && v !== '') url.searchParams.set(k, String(v));
     });
     return fetchJson(url.toString());
+  },
+
+  async getBenchmarks(): Promise<{
+    edge_benchmark: EdgeBenchmarkReport | null;
+    comparative_evaluation: any | null;
+    system_status: DefectDetectorStatus;
+  }> {
+    return fetchJson(`${API_BASE}/defects/benchmarks`);
+  },
+
+  async getModelStatus(): Promise<{
+    detector_status: DefectDetectorStatus;
+    metadata: any;
+    classes: string[];
+    supported_profiles: string[];
+  }> {
+    return fetchJson(`${API_BASE}/defects/models/status`);
+  },
+
+  async compareGoldenReference(data: {
+    inspected_image_base64: string;
+    reference_image_base64?: string;
+    inspection_id?: string;
+    profile_name?: string;
+  }): Promise<ReferenceComparisonResult> {
+    return fetchJson<ReferenceComparisonResult>(`${API_BASE}/defects/reference/compare`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+  },
+
+  async getParetoAnalytics(days?: number): Promise<ParetoAnalysis> {
+    const url = new URL(`${API_BASE}/defects/analytics/pareto`);
+    if (days) url.searchParams.set('days', String(days));
+    return fetchJson<ParetoAnalysis>(url.toString());
+  },
+
+  async exportReviewedDataset(): Promise<{
+    status: string;
+    total_samples: number;
+    class_distribution: Record<string, number>;
+    manifest_path: string;
+    message: string;
+  }> {
+    return fetchJson(`${API_BASE}/defects/dataset/export`, { method: 'POST' });
+  },
+
+  async getJetsonProfile(): Promise<JetsonProfile> {
+    return fetchJson<JetsonProfile>(`${API_BASE}/defects/models/jetson-profile`);
+  },
+
+  async quantizeModel(): Promise<any> {
+    return fetchJson(`${API_BASE}/defects/models/quantize`, { method: 'POST' });
+  },
+
+  async switchPrecision(precision: 'FP32' | 'INT8'): Promise<DefectDetectorStatus> {
+    return fetchJson<DefectDetectorStatus>(`${API_BASE}/defects/models/precision?precision=${precision}`, { method: 'POST' });
+  },
+
+  async predictAnomaly(data: { frame_base64?: string }): Promise<AnomalyPrediction> {
+    const formData = new FormData();
+    if (data.frame_base64) formData.append('frame_base64', data.frame_base64);
+    return postForm<AnomalyPrediction>(`${API_BASE}/defects/anomaly/predict`, formData);
+  },
+
+  async getPLCStatus(): Promise<PLCStatus> {
+    return fetchJson<PLCStatus>(`${API_BASE}/defects/plc/status`);
+  },
+
+  async triggerPLCReject(params?: {
+    duration_ms?: number;
+    defect_class?: string;
+    confidence?: number;
+  }): Promise<any> {
+    const url = new URL(`${API_BASE}/defects/plc/trigger`);
+    if (params?.duration_ms) url.searchParams.set('duration_ms', String(params.duration_ms));
+    if (params?.defect_class) url.searchParams.set('defect_class', params.defect_class);
+    if (params?.confidence) url.searchParams.set('confidence', String(params.confidence));
+    return fetchJson(url.toString(), { method: 'POST' });
+  },
+
+  async configurePLC(config: {
+    host?: string;
+    port?: number;
+    protocol?: string;
+    simulation_mode?: boolean;
+    default_pulse_ms?: number;
+  }): Promise<PLCStatus> {
+    return fetchJson<PLCStatus>(`${API_BASE}/defects/plc/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config),
+    });
   },
 };

@@ -11,7 +11,7 @@ import DefectTable from '@/components/DefectTable';
 import AuditTimeline from '@/components/AuditTimeline';
 import {
   ArrowLeft, Download, CheckCircle2, AlertTriangle, XCircle, FileText, RefreshCw,
-  Upload, Gauge, Lightbulb, ShieldCheck, Film, Image as ImageIcon
+  Upload, Gauge, Lightbulb, ShieldCheck, Film, Image as ImageIcon, Flame, Check, Scale
 } from 'lucide-react';
 
 export default function DefectResultPage({ params }: { params: Promise<{ id: string }> }) {
@@ -24,6 +24,7 @@ export default function DefectResultPage({ params }: { params: Promise<{ id: str
   const [uploading, setUploading] = useState(false);
   const [finalizing, setFinalizing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [viewMode, setViewMode] = useState<'DEFECTS' | 'HEATMAP' | 'REFERENCE'>('DEFECTS');
 
   const load = async (keepSelection = false) => {
     if (!keepSelection) setLoading(true);
@@ -57,6 +58,10 @@ export default function DefectResultPage({ params }: { params: Promise<{ id: str
   const activeImage = analysedImages.find((i) => i.id === activeImageId) || analysedImages[0];
   const activeDetections = detections.filter((d) => d.image_id === activeImage?.id);
   const scan = activeImage?.quality_metadata?.defect_scan;
+
+  const decision = inspection?.decision_analysis;
+  const qualityGate = inspection?.quality_gate;
+  const refAnalysis = inspection?.reference_analysis;
 
   const typeSummary = useMemo(() => {
     const counts: Record<string, number> = {};
@@ -198,6 +203,11 @@ export default function DefectResultPage({ params }: { params: Promise<{ id: str
             <div className="flex items-center gap-2">
               <span className="font-mono text-xs font-bold px-2 py-0.5 rounded-sm bg-white/70">{inspection.inspection_number}</span>
               <h2 className="font-bold text-sm tracking-tight">{oc.label}</h2>
+              {decision && (
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-black/10 font-semibold">
+                  Rule: {decision.decision_code}
+                </span>
+              )}
             </div>
             <p className="text-xs opacity-90 mt-0.5">
               {inspection.product_name || 'Unnamed Product'}
@@ -225,17 +235,94 @@ export default function DefectResultPage({ params }: { params: Promise<{ id: str
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Left: visual evidence */}
         <div className="lg:col-span-7 space-y-3">
-          {activeImage ? (
-            <DefectOverlay
-              imageUrl={getStorageUrl(activeImage.file_path)}
-              detections={activeDetections}
-              selectedId={selectedId}
-              onSelect={handleSelect}
-              caption={activeImage.original_filename}
-            />
-          ) : (
-            <div className="bg-white rounded-xl border border-[#e6e6e6] p-12 text-center text-xs text-[#615d59]">
-              No analysed images yet. Use &quot;Analyse More Images&quot; to add some.
+          {/* View mode toggle */}
+          <div className="flex items-center justify-between bg-white rounded-xl border border-[#e6e6e6] p-2">
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => setViewMode('DEFECTS')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                  viewMode === 'DEFECTS' ? 'bg-[#0075de] text-white shadow-xs' : 'text-[#615d59] hover:bg-[#f6f5f4]'
+                }`}
+              >
+                Defect Overlays
+              </button>
+              {refAnalysis?.difference_heatmap_base64 && (
+                <button
+                  type="button"
+                  onClick={() => setViewMode('HEATMAP')}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                    viewMode === 'HEATMAP' ? 'bg-[#0075de] text-white shadow-xs' : 'text-[#615d59] hover:bg-[#f6f5f4]'
+                  }`}
+                >
+                  <Flame className="w-3.5 h-3.5 text-amber-500" />
+                  Thermal Heatmap
+                </button>
+              )}
+              {referenceImage && (
+                <button
+                  type="button"
+                  onClick={() => setViewMode('REFERENCE')}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all ${
+                    viewMode === 'REFERENCE' ? 'bg-[#0075de] text-white shadow-xs' : 'text-[#615d59] hover:bg-[#f6f5f4]'
+                  }`}
+                >
+                  <ShieldCheck className="w-3.5 h-3.5 text-green-600" />
+                  Golden Reference
+                </button>
+              )}
+            </div>
+            <span className="text-[11px] text-[#615d59] font-mono px-2">
+              {viewMode === 'DEFECTS' && `${activeDetections.length} defect region${activeDetections.length !== 1 ? 's' : ''}`}
+              {viewMode === 'HEATMAP' && 'LAB Delta-E Heatmap'}
+              {viewMode === 'REFERENCE' && 'Approved Master'}
+            </span>
+          </div>
+
+          {/* Visual Canvas Display */}
+          {viewMode === 'DEFECTS' && (
+            activeImage ? (
+              <DefectOverlay
+                imageUrl={getStorageUrl(activeImage.file_path)}
+                detections={activeDetections}
+                selectedId={selectedId}
+                onSelect={handleSelect}
+                caption={activeImage.original_filename}
+              />
+            ) : (
+              <div className="bg-white rounded-xl border border-[#e6e6e6] p-12 text-center text-xs text-[#615d59]">
+                No analysed images yet. Use &quot;Analyse More Images&quot; to add some.
+              </div>
+            )
+          )}
+
+          {viewMode === 'HEATMAP' && refAnalysis && (
+            <div className="bg-white rounded-xl border border-[#e6e6e6] p-3 space-y-2">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={refAnalysis.difference_heatmap_base64}
+                alt="Difference Heatmap"
+                className="w-full h-auto rounded-lg object-contain max-h-[520px] bg-black"
+              />
+              <div className="flex items-center justify-between text-[11px] text-[#615d59] px-1 pt-1">
+                <span>ORB/RANSAC Aligned Structural Heatmap (JET Colormap: Blue=Normal, Red=Anomaly)</span>
+                <span className="font-bold text-amber-700">Mean ΔE: {refAnalysis.mean_delta_e}</span>
+              </div>
+            </div>
+          )}
+
+          {viewMode === 'REFERENCE' && referenceImage && (
+            <div className="bg-white rounded-xl border border-[#e6e6e6] p-3 space-y-2">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={getStorageUrl(referenceImage.file_path)}
+                alt="Golden Reference Sample"
+                className="w-full h-auto rounded-lg object-contain max-h-[520px] bg-black"
+              />
+              <div className="flex items-center justify-between text-[11px] text-[#615d59] px-1 pt-1">
+                <span>Approved Production Reference Sample</span>
+                <span className="font-mono text-xs">{referenceImage.original_filename}</span>
+              </div>
             </div>
           )}
 
@@ -272,8 +359,129 @@ export default function DefectResultPage({ params }: { params: Promise<{ id: str
           )}
         </div>
 
-        {/* Right: scan metrics, summary, root causes */}
+        {/* Right: decision verdict, quality gate, reference tolerances, scan metrics, root causes */}
         <div className="lg:col-span-5 space-y-4">
+          {/* 1. Defensible Decision Engine Verdict Card */}
+          {decision && (
+            <div className="bg-white rounded-xl border border-[#e6e6e6] p-4 elevation-0 space-y-2">
+              <div className="flex items-center justify-between pb-2 border-b border-[#e6e6e6]">
+                <h3 className="font-bold text-xs text-[#000000] uppercase tracking-wider flex items-center gap-1.5">
+                  <Scale className="w-4 h-4 text-[#0075de]" />
+                  Inspection Decision Rationale
+                </h3>
+                <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-[#f6f5f4] text-[#615d59]">
+                  {decision.policy_version}
+                </span>
+              </div>
+              <div className="text-xs space-y-1.5">
+                <p className="font-semibold text-[#31302e]">{decision.primary_reason}</p>
+                {decision.rule_violations && decision.rule_violations.length > 0 && (
+                  <div className="mt-2 space-y-1">
+                    <p className="text-[10px] uppercase font-bold text-red-700">Violated Tolerance Rules:</p>
+                    <ul className="text-[11px] text-red-600 list-disc pl-4 space-y-0.5 font-mono">
+                      {decision.rule_violations.map((v, i) => (
+                        <li key={i}>{v}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+                <div className="flex items-center gap-3 pt-2 text-[11px] text-[#615d59]">
+                  <span>Confidence: <b className="text-[#000000]">{decision.confidence_band}</b></span>
+                  <span>Review Required: <b className="text-[#000000]">{decision.human_review_required ? 'Yes' : 'No'}</b></span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 2. Industrial Image Quality Gate Card */}
+          {qualityGate && (
+            <div className="bg-white rounded-xl border border-[#e6e6e6] p-4 elevation-0 space-y-2">
+              <div className="flex items-center justify-between pb-2 border-b border-[#e6e6e6]">
+                <h3 className="font-bold text-xs text-[#000000] uppercase tracking-wider flex items-center gap-1.5">
+                  <ShieldCheck className="w-4 h-4 text-[#0075de]" />
+                  Image Quality Assessment Gate
+                </h3>
+                <span
+                  className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                    qualityGate.status === 'SUITABLE'
+                      ? 'bg-green-100 text-green-800'
+                      : qualityGate.status === 'SUITABLE_WITH_WARNINGS'
+                      ? 'bg-amber-100 text-amber-800'
+                      : 'bg-red-100 text-red-800'
+                  }`}
+                >
+                  {qualityGate.status}
+                </span>
+              </div>
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <div className="p-2 rounded bg-[#f6f5f4] border border-[#e6e6e6]">
+                  <p className="text-[10px] text-[#615d59]">Sharpness Index</p>
+                  <p className="font-bold text-[#000000]">{qualityGate.measurements?.sharpness ?? '—'}</p>
+                </div>
+                <div className="p-2 rounded bg-[#f6f5f4] border border-[#e6e6e6]">
+                  <p className="text-[10px] text-[#615d59]">Mean Luminance</p>
+                  <p className="font-bold text-[#000000]">{qualityGate.measurements?.exposure ?? '—'} / 255</p>
+                </div>
+                <div className="p-2 rounded bg-[#f6f5f4] border border-[#e6e6e6]">
+                  <p className="text-[10px] text-[#615d59]">Glare Area Ratio</p>
+                  <p className="font-bold text-[#000000]">
+                    {qualityGate.measurements?.glare_ratio !== undefined
+                      ? `${(qualityGate.measurements.glare_ratio * 100).toFixed(1)}%`
+                      : '—'}
+                  </p>
+                </div>
+                <div className="p-2 rounded bg-[#f6f5f4] border border-[#e6e6e6]">
+                  <p className="text-[10px] text-[#615d59]">Product Coverage</p>
+                  <p className="font-bold text-[#000000]">
+                    {qualityGate.measurements?.product_coverage_ratio !== undefined
+                      ? `${(qualityGate.measurements.product_coverage_ratio * 100).toFixed(0)}%`
+                      : '—'}
+                  </p>
+                </div>
+              </div>
+              {qualityGate.recommended_actions && qualityGate.recommended_actions.length > 0 && (
+                <div className="text-[11px] text-[#31302e] bg-amber-50 p-2.5 rounded-lg border border-amber-200 mt-2">
+                  <p className="font-semibold text-amber-900 mb-0.5">Recommended Actions:</p>
+                  <ul className="list-disc pl-4 space-y-0.5 text-amber-800">
+                    {qualityGate.recommended_actions.map((act, i) => (
+                      <li key={i}>{act}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* 3. Golden Reference Tolerances Card */}
+          {refAnalysis && (
+            <div className="bg-white rounded-xl border border-[#e6e6e6] p-4 elevation-0 space-y-2">
+              <div className="flex items-center justify-between pb-2 border-b border-[#e6e6e6]">
+                <h3 className="font-bold text-xs text-[#000000] uppercase tracking-wider flex items-center gap-1.5">
+                  <ShieldCheck className="w-4 h-4 text-[#1aae39]" />
+                  Golden Reference Compliance
+                </h3>
+                <span
+                  className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                    refAnalysis.within_tolerance ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'
+                  }`}
+                >
+                  {refAnalysis.within_tolerance ? 'WITHIN TOLERANCE' : 'TOLERANCE EXCEEDED'}
+                </span>
+              </div>
+              <div className="grid grid-cols-2 gap-2 text-xs">
+                <div className="p-2 rounded bg-[#f6f5f4] border border-[#e6e6e6]">
+                  <p className="text-[10px] text-[#615d59]">Color ΔE (Max {refAnalysis.max_color_delta_e_tolerance})</p>
+                  <p className="font-bold text-[#000000]">{refAnalysis.mean_delta_e}</p>
+                </div>
+                <div className="p-2 rounded bg-[#f6f5f4] border border-[#e6e6e6]">
+                  <p className="text-[10px] text-[#615d59]">Anomaly Area (Max {(refAnalysis.anomaly_area_tolerance * 100).toFixed(1)}%)</p>
+                  <p className="font-bold text-[#000000]">{(refAnalysis.anomaly_area_ratio * 100).toFixed(2)}%</p>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* 4. Scan Metrics Card */}
           <div className="bg-white rounded-xl border border-[#e6e6e6] p-4 elevation-0">
             <h3 className="font-bold text-xs text-[#000000] uppercase tracking-wider mb-3 pb-2 border-b border-[#e6e6e6] flex items-center gap-1.5">
               <Gauge className="w-4 h-4 text-[#0075de]" />
@@ -316,6 +524,7 @@ export default function DefectResultPage({ params }: { params: Promise<{ id: str
             )}
           </div>
 
+          {/* 5. Defect Categories Card */}
           <div className="bg-white rounded-xl border border-[#e6e6e6] p-4 elevation-0">
             <h3 className="font-bold text-xs text-[#000000] uppercase tracking-wider mb-3 pb-2 border-b border-[#e6e6e6]">
               Defect Categories
@@ -338,6 +547,7 @@ export default function DefectResultPage({ params }: { params: Promise<{ id: str
             )}
           </div>
 
+          {/* 6. Root Causes Card */}
           {(inspection.root_causes || []).length > 0 && (
             <div className="bg-amber-50/60 rounded-xl border border-amber-200 p-4">
               <h3 className="font-bold text-xs text-[#854D0E] uppercase tracking-wider mb-3 flex items-center gap-1.5">
@@ -356,20 +566,6 @@ export default function DefectResultPage({ params }: { params: Promise<{ id: str
                     <p className="mt-1 text-[11px] text-[#31302e]">→ {rc.recommended_actions[0]}</p>
                   </div>
                 ))}
-              </div>
-            </div>
-          )}
-
-          {referenceImage && (
-            <div className="bg-white rounded-xl border border-[#e6e6e6] p-4 elevation-0 flex items-center gap-3">
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img src={getStorageUrl(referenceImage.file_path)} alt="Golden reference" className="w-16 h-16 object-cover rounded-md border border-[#e6e6e6]" />
-              <div>
-                <p className="text-xs font-bold text-[#000000] flex items-center gap-1.5">
-                  <ShieldCheck className="w-3.5 h-3.5 text-[#1aae39]" />
-                  Golden Reference Sample
-                </p>
-                <p className="text-[11px] text-[#615d59]">{referenceImage.original_filename}</p>
               </div>
             </div>
           )}

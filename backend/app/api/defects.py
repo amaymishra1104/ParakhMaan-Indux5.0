@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 import cv2
+import numpy as np
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
@@ -17,13 +18,17 @@ from app.models.all_models import (
 )
 from app.schemas.all_schemas import (
     DefectDetectionResponse, DefectFeedbackRequest, DefectFinalizeRequest, DefectFrameRequest,
-    DefectInspectionCreate, DefectInspectionDetailResponse, DefectInspectionSummary, ImageResponse
+    DefectInspectionCreate, DefectInspectionDetailResponse, DefectInspectionSummary,
+    GoldenReferenceCompareRequest, ImageResponse
 )
 from app.services.defect_analytics_service import build_defect_analytics
 from app.services.defect_detection_service import (
     DEFECT_TYPES, compute_outcome, decode_base64_image, defect_detector, grade_severity,
     synthesize_surface_sample
 )
+from app.services.industrial_quality_gate import industrial_quality_gate
+from app.services.golden_reference_service import golden_reference_service
+from app.services.inspection_decision_engine import inspection_decision_engine
 from app.services.heatmap_service import heatmap_service
 from app.services.image_quality import image_quality_analyzer
 from app.services.pdf_report_service import pdf_report_service
@@ -135,17 +140,46 @@ def _store_detections(
 def _refresh_outcome(db: Session, insp: Inspection) -> str:
     dets = [_detection_dict(d) for d in insp.defect_detections]
     analysed = [img for img in insp.images if img.surface_type != REFERENCE_SURFACE]
-    # The label-oriented blur / blank checks read smooth, uniform (i.e. defect-free) surfaces as
-    # "blurry" or "empty", so only frames too dark or saturated to inspect force a review.
-    quality_issue = any(
-        not (img.quality_metadata or {}).get("defect_scan", {}).get("exposure_ok", True) for img in analysed
-    )
     if not analysed:
         insp.overall_outcome = "PENDING"
-    else:
-        insp.overall_outcome = compute_outcome(dets, quality_issue=quality_issue)
+        insp.status = "DRAFT"
+        db.commit()
+        return insp.overall_outcome
+
+    # Extract quality gate summary
+    quality_gate_result = None
+    for img in analysed:
+        q_meta = img.quality_metadata or {}
+        if "quality_status" in q_meta:
+            quality_gate_result = q_meta
+            if q_meta.get("quality_status") == "UNSUITABLE":
+                break
+
+    # Extract reference comparison if available
+    ref_comparison = None
+    for img in analysed:
+        q_meta = img.quality_metadata or {}
+        if "reference_comparison" in q_meta and q_meta["reference_comparison"]:
+            ref_comparison = q_meta["reference_comparison"]
+            break
+
+    # Evaluate outcome through the defensible decision engine
+    decision = inspection_decision_engine.evaluate(
+        detections=dets,
+        quality_gate=quality_gate_result,
+        reference_comparison=ref_comparison,
+        reviewer_actions=[{"action_type": a.action_type, "severity": a.target_field} for a in insp.reviewer_actions] if insp.reviewer_actions else None,
+    )
+    insp.overall_outcome = decision["outcome"]
+
     if insp.status != "FINALIZED":
-        insp.status = "ANALYZED" if insp.overall_outcome == "PASS" else ("DRAFT" if not analysed else "REVIEW")
+        if insp.overall_outcome == "PASS":
+            insp.status = "ANALYZED"
+        elif insp.overall_outcome == "REVIEW":
+            insp.status = "REVIEW"
+        else:
+            insp.status = "DEFECTIVE"
+
     insp.report_path = None
     db.commit()
     return insp.overall_outcome
@@ -164,11 +198,39 @@ def _analyze_and_store(
     db: Session, insp: Inspection, file_path: str, original_filename: str, surface_type: str,
     user_id: Optional[str], event_type: str
 ) -> Dict[str, Any]:
-    quality = image_quality_analyzer.analyze(file_path)
+    # 1. Optical Industrial Quality Gate
+    img_bgr = cv2.imread(file_path)
+    if img_bgr is None:
+        raise HTTPException(status_code=400, detail=f"Unable to decode uploaded image: {file_path}")
+
+    quality = industrial_quality_gate.evaluate(img_bgr)
+
+    # 2. Golden-Reference Comparison (Alignment & Difference Heatmap)
+    ref_path = _reference_path(insp)
+    ref_comparison = None
+    if ref_path and surface_type != REFERENCE_SURFACE and os.path.exists(ref_path):
+        ref_bgr = cv2.imread(ref_path)
+        if ref_bgr is not None:
+            ref_comparison = golden_reference_service.compare(img_bgr, ref_bgr, insp.category)
+
+    # 3. Defect Detection Engine (ONNX + OpenCV Fusion)
     try:
-        scan = defect_detector.detect_file(file_path, _reference_path(insp))
+        scan = defect_detector.detect(img_bgr, cv2.imread(ref_path) if ref_path else None)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+    # Fold reference anomaly regions into scan if present
+    if ref_comparison and ref_comparison.get("anomaly_regions"):
+        for reg in ref_comparison["anomaly_regions"]:
+            scan["detections"].append({
+                "defect_type": "DISCOLOURATION" if reg.get("mean_delta_e", 0) > 30 else "DIMENSIONAL_ANOMALY",
+                "bbox": [float(v) for v in reg["bbox"]],
+                "confidence": min(0.92, 0.55 + reg.get("area_ratio", 0) * 10),
+                "severity": reg.get("severity", "MEDIUM"),
+                "detector": "GOLDEN_REFERENCE",
+                "metrics": {"method": "reference_difference", "mean_delta_e": reg.get("mean_delta_e")},
+                "reviewer_status": "PENDING",
+            })
 
     image = ImageModel(
         inspection_id=insp.id,
@@ -176,7 +238,11 @@ def _analyze_and_store(
         file_path=file_path,
         original_filename=original_filename,
         quality_score=quality["quality_score"],
-        quality_metadata={**quality, "defect_scan": _scan_meta(scan)},
+        quality_metadata={
+            **quality,
+            "defect_scan": _scan_meta(scan),
+            "reference_comparison": ref_comparison,
+        },
         ocr_raw_data=[],
     )
     db.add(image)
@@ -186,8 +252,8 @@ def _analyze_and_store(
     rows = _store_detections(db, insp, image, scan["detections"])
     _audit(
         db, insp.id, user_id, event_type,
-        f"{surface_type} analysed in {scan['latency_ms']} ms ({scan['backend']}): {_describe(scan['detections'])}",
-        {"image_id": image.id, "detections": len(rows), "latency_ms": scan["latency_ms"]},
+        f"{surface_type} inspected in {scan['latency_ms']} ms ({scan['backend']}): {_describe(scan['detections'])}. Quality: {quality['quality_status']}",
+        {"image_id": image.id, "detections": len(rows), "latency_ms": scan["latency_ms"], "quality_status": quality["quality_status"]},
     )
     db.commit()
     db.refresh(insp)
@@ -197,18 +263,37 @@ def _analyze_and_store(
         "image": ImageResponse.model_validate(image),
         "detections": [DefectDetectionResponse.model_validate(r) for r in rows],
         "scan": _scan_meta(scan),
+        "quality_gate": quality,
+        "reference_comparison": ref_comparison,
         "overall_outcome": outcome,
     }
 
 
 def _build_detail(insp: Inspection) -> Dict[str, Any]:
     detail = DefectInspectionDetailResponse.model_validate(insp).model_dump()
+    dets = [_detection_dict(d) for d in insp.defect_detections]
     analytics = build_defect_analytics(
         inspections=[{"id": insp.id, "product_name": insp.product_name, "overall_outcome": insp.overall_outcome, "created_at": insp.created_at}],
-        detections=[_detection_dict(d) for d in insp.defect_detections],
+        detections=dets,
         days=1,
     )
     detail["root_causes"] = analytics["root_causes"]
+
+    # Gather latest quality gate & reference analysis
+    analysed = [img for img in insp.images if img.surface_type != REFERENCE_SURFACE]
+    for img in analysed:
+        q_meta = img.quality_metadata or {}
+        if "quality_status" in q_meta and not detail.get("quality_gate"):
+            detail["quality_gate"] = q_meta
+        if "reference_comparison" in q_meta and not detail.get("reference_analysis"):
+            detail["reference_analysis"] = q_meta["reference_comparison"]
+
+    detail["decision_analysis"] = inspection_decision_engine.evaluate(
+        detections=dets,
+        quality_gate=detail.get("quality_gate"),
+        reference_comparison=detail.get("reference_analysis"),
+        reviewer_actions=[{"action_type": a.action_type, "severity": a.target_field} for a in insp.reviewer_actions] if insp.reviewer_actions else None,
+    )
     return detail
 
 
@@ -658,7 +743,7 @@ def submit_detection_feedback(
 # ---------------------------------------------------------------- live / real-time
 @router.post("/analyze-frame")
 def analyze_live_frame(req: DefectFrameRequest, db: Session = Depends(get_db)):
-    """Stateless single-frame detection for the live camera loop (nothing is persisted)."""
+    """Stateless single-frame detection for the live camera loop with quality gate & decision engine."""
     img = decode_base64_image(req.image_base64)
     if img is None:
         raise HTTPException(status_code=400, detail="Invalid base64 image data")
@@ -667,8 +752,28 @@ def analyze_live_frame(req: DefectFrameRequest, db: Session = Depends(get_db)):
         insp = db.query(Inspection).filter(Inspection.id == req.inspection_id).first()
         ref_path = _reference_path(insp) if insp else None
         ref = cv2.imread(ref_path) if ref_path else None
+
+    # Optical quality gate evaluation
+    qg = industrial_quality_gate.analyze(img)
+
     scan = defect_detector.detect(img, ref, max_side=req.max_side)
-    return {**_scan_meta(scan), "detections": scan["detections"]}
+
+    # Defensible inspection decision
+    profile = req.product_profile or "METAL_SHEET"
+    dec = inspection_decision_engine.evaluate(
+        detections=scan["detections"],
+        quality_gate=qg,
+        profile_name=profile,
+    )
+
+    return {
+        **_scan_meta(scan),
+        "detections": scan["detections"],
+        "quality_gate": qg,
+        "decision": dec["outcome"],
+        "decision_code": dec["decision_code"],
+        "decision_reasons": dec.get("reasons", []),
+    }
 
 
 # ---------------------------------------------------------------- analytics & log
@@ -801,3 +906,303 @@ def seed_defect_demo(db: Session = Depends(get_db)):
 @router.get("/types")
 def get_defect_types():
     return {"defect_types": DEFECT_TYPES}
+
+
+# ---------------------------------------------------------------- benchmarks & models
+@router.get("/benchmarks")
+def get_benchmarks():
+    """Retrieve verified edge performance benchmarks and comparative model metrics."""
+    edge_path = os.path.join(settings.STORAGE_DIR, "benchmarks", "edge_benchmark_report.json")
+    comp_path = os.path.join(settings.STORAGE_DIR, "benchmarks", "benchmark_results.json")
+    
+    edge_report = None
+    comparative_results = None
+    
+    if os.path.exists(edge_path):
+        try:
+            with open(edge_path, "r", encoding="utf-8") as f:
+                edge_report = json.load(f)
+        except Exception:
+            pass
+            
+    if os.path.exists(comp_path):
+        try:
+            with open(comp_path, "r", encoding="utf-8") as f:
+                comparative_results = json.load(f)
+        except Exception:
+            pass
+            
+    return {
+        "edge_benchmark": edge_report,
+        "comparative_evaluation": comparative_results,
+        "system_status": defect_detector.status(),
+    }
+
+
+@router.get("/models/status")
+def get_model_status():
+    """Return detector status, active inference engine, model version, and class labels."""
+    status = defect_detector.status()
+    meta_path = os.path.join(os.path.dirname(settings.DEFECT_MODEL_PATH), "metadata.json")
+    metadata = {}
+    if os.path.exists(meta_path):
+        try:
+            with open(meta_path, "r", encoding="utf-8") as f:
+                metadata = json.load(f)
+        except Exception:
+            pass
+    return {
+        "detector_status": status,
+        "metadata": metadata,
+        "classes": DEFECT_TYPES,
+        "supported_profiles": list(golden_reference_service.PROFILES.keys()),
+    }
+
+
+@router.post("/reference/compare")
+def compare_reference(req: GoldenReferenceCompareRequest, db: Session = Depends(get_db)):
+    """Run reference-guided alignment, LAB Delta-E difference mapping, and tolerance evaluation."""
+    inspected = decode_base64_image(req.inspected_image_base64)
+    if inspected is None:
+        raise HTTPException(status_code=400, detail="Invalid inspected image base64")
+        
+    reference = None
+    if req.reference_image_base64:
+        reference = decode_base64_image(req.reference_image_base64)
+    elif req.inspection_id:
+        insp = db.query(Inspection).filter(Inspection.id == req.inspection_id).first()
+        ref_path = _reference_path(insp) if insp else None
+        if ref_path and os.path.exists(ref_path):
+            reference = cv2.imread(ref_path)
+            
+    if reference is None:
+        raise HTTPException(status_code=400, detail="No golden reference image provided or found for inspection")
+        
+    res = golden_reference_service.align_and_compare(
+        inspected=inspected,
+        reference=reference,
+        profile_name=req.profile_name or "METAL_SHEET",
+    )
+    return res
+
+
+@router.get("/analytics/pareto")
+def get_pareto_analytics(days: int = Query(90, ge=1, le=365), db: Session = Depends(get_db)):
+    """Compute real 80/20 Pareto distribution of detected vs confirmed defects."""
+    since = datetime.now(timezone.utc) - timedelta(days=days)
+    query = db.query(Inspection).filter(Inspection.inspection_mode == DEFECT_MODE, Inspection.created_at >= since.replace(tzinfo=None))
+    ids = [i.id for i in query.all()]
+    
+    counts: Dict[str, int] = {k: 0 for k in DEFECT_TYPES}
+    confirmed_counts: Dict[str, int] = {k: 0 for k in DEFECT_TYPES}
+    total_detections = 0
+    total_confirmed = 0
+    
+    if ids:
+        dets = db.query(DefectDetection).filter(DefectDetection.inspection_id.in_(ids)).all()
+        for d in dets:
+            total_detections += 1
+            cat = d.defect_type.upper() if d.defect_type else "SCRATCH"
+            counts[cat] = counts.get(cat, 0) + 1
+            if d.reviewer_status == "CONFIRMED":
+                total_confirmed += 1
+                confirmed_counts[cat] = confirmed_counts.get(cat, 0) + 1
+
+    sorted_items = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+    cumulative = 0
+    pareto_data = []
+    eighty_cutoff_reached = False
+    vital_few = []
+    
+    for cat, cnt in sorted_items:
+        cumulative += cnt
+        pct = (cumulative / total_detections * 100.0) if total_detections > 0 else 0.0
+        pareto_data.append({
+            "category": cat,
+            "count": cnt,
+            "confirmed_count": confirmed_counts.get(cat, 0),
+            "percentage": round((cnt / total_detections * 100.0) if total_detections > 0 else 0.0, 1),
+            "cumulative_percentage": round(pct, 1),
+            "in_vital_few": not eighty_cutoff_reached,
+        })
+        if not eighty_cutoff_reached:
+            vital_few.append(cat)
+            if pct >= 80.0:
+                eighty_cutoff_reached = True
+
+    return {
+        "total_detections": total_detections,
+        "total_confirmed": total_confirmed,
+        "vital_few": vital_few,
+        "pareto_distribution": pareto_data,
+    }
+
+
+@router.post("/dataset/export")
+def export_reviewed_dataset(db: Session = Depends(get_db)):
+    """Export reviewed & confirmed annotations for the controlled model-improvement loop."""
+    dets = db.query(DefectDetection, ImageModel).join(ImageModel, ImageModel.id == DefectDetection.image_id).filter(
+        DefectDetection.reviewer_status.in_(["CONFIRMED", "RELABELED"])
+    ).all()
+    
+    export_dir = os.path.join(settings.STORAGE_DIR, "reviewed_dataset")
+    os.makedirs(export_dir, exist_ok=True)
+    
+    manifest = []
+    class_counts: Dict[str, int] = {}
+    for d, img in dets:
+        cat = (d.label if d.label else d.defect_type).upper()
+        class_counts[cat] = class_counts.get(cat, 0) + 1
+        manifest.append({
+            "detection_id": d.id,
+            "image_path": img.file_path,
+            "label": cat,
+            "box": {
+                "x_min": d.x_min,
+                "y_min": d.y_min,
+                "x_max": d.x_max,
+                "y_max": d.y_max,
+            },
+            "confidence": d.confidence,
+            "reviewer_status": d.reviewer_status,
+            "reviewer_notes": d.reviewer_notes,
+            "created_at": d.created_at.isoformat() if d.created_at else None,
+        })
+        
+    manifest_path = os.path.join(export_dir, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "export_timestamp": datetime.now(timezone.utc).isoformat(),
+            "total_samples": len(manifest),
+            "class_distribution": class_counts,
+            "samples": manifest,
+        }, f, indent=2)
+        
+    return {
+        "status": "SUCCESS",
+        "total_samples": len(manifest),
+        "class_distribution": class_counts,
+        "manifest_path": manifest_path,
+        "message": f"Exported {len(manifest)} validated samples for retrain pipeline."
+    }
+
+
+# ---------------------------------------------------------------- Edge Hardware & Quantization
+@router.get("/models/jetson-profile")
+def get_jetson_profile():
+    """Retrieve NVIDIA Jetson Orin Nano edge gateway deployment specifications & benchmarks."""
+    profile_path = os.path.join(os.path.dirname(settings.DEFECT_MODEL_PATH), "jetson_orin_nano_profile.json")
+    if os.path.exists(profile_path):
+        with open(profile_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {
+        "status": "NOT_GENERATED",
+        "message": "Run POST /api/v1/defects/models/quantize to export INT8 model and profile.",
+        "target_device": "NVIDIA Jetson Orin Nano (8GB / 4GB)",
+    }
+
+
+@router.post("/models/quantize")
+def quantize_model():
+    """Quantize FP32 ONNX model dynamically to INT8 precision for Jetson Orin Nano edge execution."""
+    from scripts.quantize_model_int8 import quantize_fp32_to_int8
+    base_dir = os.path.dirname(settings.DEFECT_MODEL_PATH)
+    int8_path = os.path.join(base_dir, "parakhmaan_defect_v1_int8.onnx")
+    profile = quantize_fp32_to_int8(settings.DEFECT_MODEL_PATH, int8_path)
+    return {
+        "status": "SUCCESS",
+        "int8_model_path": int8_path,
+        "profile": profile,
+    }
+
+
+@router.post("/models/precision")
+def switch_model_precision(precision: str = Query("INT8", pattern=r"^(?i)(FP32|INT8)$")):
+    """Switch active runtime precision between FP32 and INT8 quantization modes."""
+    return defect_detector.switch_precision(precision)
+
+
+# ---------------------------------------------------------------- Unsupervised PatchCore Anomaly
+@router.post("/anomaly/predict")
+async def predict_anomaly(
+    file: Optional[UploadFile] = File(None),
+    frame_base64: Optional[str] = Form(None),
+):
+    """Zero-shot novelty detection using PatchCore memory bank without requiring defect labels."""
+    from app.services.patchcore_anomaly_service import patchcore_service
+    if file:
+        content = await file.read()
+        arr = np.frombuffer(content, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    elif frame_base64:
+        img = decode_base64_image(frame_base64)
+    else:
+        raise HTTPException(status_code=400, detail="Must provide an image file or frame_base64")
+
+    if img is None:
+        raise HTTPException(status_code=400, detail="Unable to decode image")
+
+    return await run_in_threadpool(patchcore_service.predict, img)
+
+
+@router.post("/anomaly/train-bank")
+async def train_anomaly_memory_bank(
+    files: List[UploadFile] = File(...),
+    coreset_ratio: float = Form(0.30),
+):
+    """Calibrate and fit the PatchCore memory bank using defect-free golden reference images."""
+    from app.services.patchcore_anomaly_service import patchcore_service
+    normal_images = []
+    for f in files:
+        content = await f.read()
+        arr = np.frombuffer(content, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is not None:
+            normal_images.append(img)
+
+    if not normal_images:
+        raise HTTPException(status_code=400, detail="No valid images uploaded to fit memory bank")
+
+    return await run_in_threadpool(patchcore_service.fit, normal_images, coreset_ratio)
+
+
+# ---------------------------------------------------------------- Industrial PLC Integration
+@router.get("/plc/status")
+def get_plc_status():
+    """Retrieve real-time Modbus TCP / OPC-UA coil registers and pneumatic actuator state."""
+    from app.services.industrial_plc_service import plc_service
+    return plc_service.get_status()
+
+
+@router.post("/plc/trigger")
+def trigger_plc_reject(
+    duration_ms: int = Query(150, ge=20, le=2000),
+    defect_class: str = Query("SCRATCH"),
+    confidence: float = Query(0.95, ge=0.0, le=1.0),
+):
+    """Manually test and actuate high-speed pneumatic blow-off rejection valve."""
+    from app.services.industrial_plc_service import plc_service
+    return plc_service.trigger_pneumatic_reject(
+        duration_ms=duration_ms,
+        defect_class=defect_class,
+        confidence=confidence,
+    )
+
+
+@router.post("/plc/config")
+def configure_plc(
+    host: Optional[str] = Body(None),
+    port: Optional[int] = Body(None),
+    protocol: Optional[str] = Body(None),
+    simulation_mode: Optional[bool] = Body(None),
+    default_pulse_ms: Optional[int] = Body(None),
+):
+    """Configure industrial PLC communication parameters and hardware vs simulation mode."""
+    from app.services.industrial_plc_service import plc_service
+    return plc_service.configure(
+        host=host,
+        port=port,
+        protocol=protocol,
+        simulation_mode=simulation_mode,
+        default_pulse_ms=default_pulse_ms,
+    )

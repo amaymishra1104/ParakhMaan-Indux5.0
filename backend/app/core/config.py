@@ -28,9 +28,14 @@ class Settings(BaseSettings):
     # Defect Inspection mode
     # DEFECT_DETECTOR_BACKEND: "hybrid" (ONNX model if present + OpenCV), "opencv", or "onnx"
     DEFECT_DETECTOR_BACKEND: str = os.getenv("DEFECT_DETECTOR_BACKEND", "hybrid")
-    # Optional YOLOv8-style ONNX export; classes come from DEFECT_MODEL_CLASSES or a sidecar <model>.names file
-    DEFECT_MODEL_PATH: str = os.getenv("DEFECT_MODEL_PATH", "")
-    DEFECT_MODEL_CLASSES: str = os.getenv("DEFECT_MODEL_CLASSES", "")
+    DEFECT_MODEL_PATH: str = os.getenv(
+        "DEFECT_MODEL_PATH",
+        str(BASE_DIR / "app" / "models_cv" / "parakhmaan_defect_v1.onnx")
+    )
+    DEFECT_MODEL_CLASSES: str = os.getenv(
+        "DEFECT_MODEL_CLASSES",
+        "SCRATCH,CRACK,DENT,DISCOLOURATION,DIMENSIONAL_ANOMALY"
+    )
     DEFECT_MODEL_INPUT_SIZE: int = int(os.getenv("DEFECT_MODEL_INPUT_SIZE", "640"))
     DEFECT_MODEL_CONF_THRESHOLD: float = float(os.getenv("DEFECT_MODEL_CONF_THRESHOLD", "0.35"))
     DEFECT_SAMPLES_DIR: str = os.getenv("DEFECT_SAMPLES_DIR", str(BASE_DIR / "storage" / "defect_samples"))

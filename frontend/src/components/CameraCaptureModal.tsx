@@ -269,19 +269,34 @@ export default function CameraCaptureModal({
                     {liveResult ? ` · ${liveResult.latency_ms} ms` : ''}
                   </span>
                   {liveResult && (
-                    <span
-                      className={`text-[10px] font-mono font-bold px-2 py-1 rounded-sm ${
-                        liveResult.detections.length === 0
-                          ? 'bg-green-600/80 text-white'
-                          : liveResult.outcome === 'DEFECTIVE'
-                          ? 'bg-red-600/85 text-white'
-                          : 'bg-amber-500/85 text-white'
-                      }`}
-                    >
-                      {liveResult.detections.length === 0
-                        ? 'NO DEFECTS'
-                        : `${liveResult.detections.length} DEFECT${liveResult.detections.length > 1 ? 'S' : ''} · ${liveResult.outcome}`}
-                    </span>
+                    <>
+                      <span
+                        className={`text-[10px] font-mono font-bold px-2 py-1 rounded-sm ${
+                          liveResult.detections.length === 0
+                            ? 'bg-green-600/80 text-white'
+                            : liveResult.outcome === 'DEFECTIVE'
+                            ? 'bg-red-600/85 text-white'
+                            : 'bg-amber-500/85 text-white'
+                        }`}
+                      >
+                        {liveResult.detections.length === 0
+                          ? 'NO DEFECTS'
+                          : `${liveResult.detections.length} DEFECT${liveResult.detections.length > 1 ? 'S' : ''} · ${liveResult.outcome}`}
+                      </span>
+                      {liveResult.quality_gate && (
+                        <span
+                          className={`text-[9px] font-mono font-bold px-2 py-0.5 rounded-sm ${
+                            liveResult.quality_gate.status === 'SUITABLE'
+                              ? 'bg-blue-600/80 text-white'
+                              : liveResult.quality_gate.status === 'SUITABLE_WITH_WARNINGS'
+                              ? 'bg-amber-600/85 text-white'
+                              : 'bg-red-600/90 text-white'
+                          }`}
+                        >
+                          OPTICS: {liveResult.quality_gate.status}
+                        </span>
+                      )}
+                    </>
                   )}
                   {liveError && (
                     <span className="text-[10px] font-mono text-white bg-red-700/80 px-2 py-1 rounded-sm max-w-[220px] truncate">
